@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         XJTUPdfDownloader
 // @namespace    xjtu-pdf-downloader
-// @version      0.5.0
+// @version      0.6.0
 // @description  在阅读器页面显示页码、文件名与 png.dll?pid 的对应关系，并支持导出 PDF
 // @match        http://jiaocai1.lib.xjtu.edu.cn:9088/jpath/reader/reader.shtml*
 // @require      https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js
 // @connect      jiaocai1.lib.xjtu.edu.cn
 // @connect      202.117.24.155
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
 // ==/UserScript==
 
 (function () {
@@ -15,10 +17,8 @@
 
 const CONFIG = {
   requestDelayMs: 200,
-  initialBatchSize: 12,
   requestTimeoutMs: 12000,
   maxRowsRendered: 400,
-  pdfImageQuality: 0.92,
   pdfRequestRetryModes: ['arraybuffer', 'blob', 'binary-text'],
 };
 
@@ -54,18 +54,29 @@ function padPageStr(pageNum, prefix) {
   return prefix + pad + pageNum;
 }
 
-function imageToJpegDataUrl(image, quality) {
+function renderImageToPdfCanvas(image, maxDimension) {
+  const limit = normalizeMaxImageDimension(maxDimension);
+  const maxSide = Math.max(image.naturalWidth, image.naturalHeight);
+  const scale = limit > 0 && maxSide > limit ? limit / maxSide : 1;
+  const width = Math.max(1, Math.round(image.naturalWidth * scale));
+  const height = Math.max(1, Math.round(image.naturalHeight * scale));
   const canvas = document.createElement('canvas');
-  canvas.width = image.naturalWidth;
-  canvas.height = image.naturalHeight;
+  canvas.width = width;
+  canvas.height = height;
   const ctx = canvas.getContext('2d');
   if (!ctx) {
     throw new Error('canvas 2d context unavailable');
   }
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.drawImage(image, 0, 0);
-  return canvas.toDataURL('image/jpeg', quality);
+  ctx.drawImage(image, 0, 0, width, height);
+  return { canvas, width, height };
+}
+
+function releaseCanvas(canvas) {
+  if (!canvas) return;
+  canvas.width = 1;
+  canvas.height = 1;
 }
 
 function sanitizeFileName(name) {
@@ -79,6 +90,88 @@ function normalizeRequestDelayMs(inputValue) {
     return CONFIG.requestDelayMs;
   }
   return Math.max(0, Math.min(parsed, 60000));
+}
+
+function normalizeMaxRetries(inputValue) {
+  const parsed = Number.parseInt(String(inputValue), 10);
+  if (!Number.isInteger(parsed)) {
+    return 2;
+  }
+  return Math.max(0, Math.min(parsed, 5));
+}
+
+function normalizeMaxImageDimension(inputValue) {
+  const parsed = Number.parseInt(String(inputValue), 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return 0;
+  }
+  return Math.max(512, Math.min(parsed, 10000));
+}
+
+function normalizeErrorMessage(error) {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  return String(error || 'unknown');
+}
+
+function getErrorStageLabel(stage) {
+  switch (String(stage || '').trim()) {
+    case 'pid':
+      return 'PID获取';
+    case 'image':
+      return '拉图片';
+    case 'pdf':
+      return '生成PDF';
+    default:
+      return '未知阶段';
+  }
+}
+
+function clearRowError(row) {
+  row.lastErrorStage = '';
+  row.lastErrorMessage = '';
+  return row;
+}
+
+function setRowError(row, stage, error) {
+  const message = normalizeErrorMessage(error);
+  row.lastErrorStage = String(stage || '');
+  row.lastErrorMessage = message;
+  row.status = `${getErrorStageLabel(stage)}失败: ${message}`;
+  return row;
+}
+
+function buildFailureRecord(row, stage, error) {
+  return {
+    row,
+    stage,
+    stageLabel: getErrorStageLabel(stage),
+    message: normalizeErrorMessage(error),
+  };
+}
+
+function formatFailureRecord(record) {
+  return `第 ${record.row.totalPage} 页 [${record.stageLabel}] ${record.message}`;
+}
+
+function summariseFailuresByStage(failedRows) {
+  const counts = new Map();
+  failedRows.forEach((item) => {
+    const key = String(item && item.stage ? item.stage : 'unknown');
+    counts.set(key, (counts.get(key) || 0) + 1);
+  });
+  return Array.from(counts.entries()).map(([stage, count]) => ({
+    stage,
+    stageLabel: getErrorStageLabel(stage),
+    count,
+  }));
+}
+
+function formatFailureStageSummary(failedRows) {
+  const parts = summariseFailuresByStage(failedRows)
+    .map((item) => `${item.stageLabel} ${item.count} 页`);
+  return parts.join('，');
 }
 
 function normalizeChapterTitle(title) {
@@ -99,35 +192,17 @@ function getPublicationPageNumber(row) {
   return Number.isInteger(totalPage) && totalPage > 0 ? totalPage : 1;
 }
 
-function requestWithRedirectInfo(url, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    GM_xmlhttpRequest({
-      method: 'GET',
-      url,
-      timeout: timeoutMs,
-      anonymous: false,
-      withCredentials: true,
-      redirect: 'follow',
-      onload(response) {
-        resolve(response);
-      },
-      ontimeout() {
-        reject(new Error(`timeout after ${timeoutMs}ms`));
-      },
-      onerror(error) {
-        reject(error instanceof Error ? error : new Error(String(error)));
-      },
-    });
-  });
+function buildReaderRequestHeaders(extraHeaders) {
+  return {
+    // png.dll 在缺少 Referer 时常返回 200 + 空包，这里显式带上来源页。
+    Referer: location.href,
+    Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+    ...(extraHeaders || {}),
+  };
 }
 
-function parseHeaderValue(headersText, headerName) {
-  const text = String(headersText || '');
-  const match = text.match(new RegExp(`^${headerName}:\\s*([^\\r\\n;]+)`, 'im'));
-  return match ? match[1].trim() : '';
-}
-
-function requestRaw(url, timeoutMs, mode) {
+function buildRequestOptions(url, timeoutMs, options) {
+  const nextOptions = options || {};
   const requestOptions = {
     method: 'GET',
     url,
@@ -135,21 +210,25 @@ function requestRaw(url, timeoutMs, mode) {
     anonymous: false,
     withCredentials: true,
     redirect: 'follow',
-    headers: {
-      // png.dll 在缺少 Referer 时常返回 200 + 空包，这里显式带上来源页。
-      Referer: location.href,
-      Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
-    },
   };
 
-  if (mode === 'arraybuffer') {
+  if (nextOptions.headers && Object.keys(nextOptions.headers).length > 0) {
+    requestOptions.headers = nextOptions.headers;
+  }
+
+  if (nextOptions.mode === 'arraybuffer') {
     requestOptions.responseType = 'arraybuffer';
-  } else if (mode === 'blob') {
+  } else if (nextOptions.mode === 'blob') {
     requestOptions.responseType = 'blob';
-  } else if (mode === 'binary-text') {
+  } else if (nextOptions.mode === 'binary-text') {
     requestOptions.overrideMimeType = 'text/plain; charset=x-user-defined';
   }
 
+  return requestOptions;
+}
+
+function requestGet(url, timeoutMs, options) {
+  const requestOptions = buildRequestOptions(url, timeoutMs, options);
   return new Promise((resolve, reject) => {
     GM_xmlhttpRequest({
       ...requestOptions,
@@ -164,6 +243,20 @@ function requestRaw(url, timeoutMs, mode) {
       },
     });
   });
+}
+
+function requestReaderResource(url, timeoutMs, options) {
+  const nextOptions = options || {};
+  return requestGet(url, timeoutMs, {
+    ...nextOptions,
+    headers: buildReaderRequestHeaders(nextOptions.headers),
+  });
+}
+
+function parseHeaderValue(headersText, headerName) {
+  const text = String(headersText || '');
+  const match = text.match(new RegExp(`^${headerName}:\\s*([^\\r\\n;]+)`, 'im'));
+  return match ? match[1].trim() : '';
 }
 
 function binaryTextToBlob(binaryText, contentType) {
@@ -211,6 +304,17 @@ function normalizePngUrl(row) {
   return '';
 }
 
+function extractPidFromUrl(url) {
+  const text = String(url || '').trim();
+  if (!text) return '';
+  try {
+    const parsed = new URL(text, location.href);
+    return parsed.searchParams.get('pid') || '';
+  } catch {
+    return '';
+  }
+}
+
 function buildImageUrlCandidates(row) {
   const candidates = [];
   const seen = new Set();
@@ -231,7 +335,7 @@ async function requestImageBlob(url, timeoutMs) {
 
   for (const mode of CONFIG.pdfRequestRetryModes) {
     try {
-      const response = await requestRaw(url, timeoutMs, mode);
+      const response = await requestReaderResource(url, timeoutMs, { mode });
       const status = Number(response.status || 0);
       if (status < 200 || status >= 300) {
         errors.push(`${mode}:http-${status || 'unknown'}`);
@@ -257,6 +361,22 @@ async function requestImageBlob(url, timeoutMs) {
   }
 
   throw new Error(`image request failed: ${errors.join(' | ')}`);
+}
+
+async function requestRowImageBlob(row, timeoutMs) {
+  const candidates = buildImageUrlCandidates(row);
+  const candidateErrors = [];
+
+  for (const candidateUrl of candidates) {
+    try {
+      return await requestImageBlob(candidateUrl, timeoutMs);
+    } catch (error) {
+      const candidateType = candidateUrl === row.localUrl ? 'reader-url' : 'png-url';
+      candidateErrors.push(`${candidateType}: ${normalizeErrorMessage(error)}`);
+    }
+  }
+
+  throw new Error(candidateErrors.join(' | ') || 'image request failed');
 }
 
 function loadImageFromBlob(blob) {
@@ -293,6 +413,379 @@ function loadImageFromBlob(blob) {
 
     tryNext();
   });
+}
+
+const SETTINGS_STORAGE_KEY = 'xjtu_pdf_downloader_settings';
+const CACHE_DB_NAME = 'xjtu_pdf_downloader_cache';
+const CACHE_DB_VERSION = 1;
+const JOB_STORE_NAME = 'jobs';
+const PAGE_STORE_NAME = 'pages';
+const BLOB_STORE_NAME = 'page_blobs';
+
+const DEFAULT_SETTINGS = Object.freeze({
+  requestDelayMs: CONFIG.requestDelayMs,
+  maxRetries: 2,
+  continueOnError: true,
+  maxImageDimension: 0,
+});
+
+let cacheDbPromise = null;
+
+function normalizeSettings(input) {
+  const raw = input && typeof input === 'object' ? input : {};
+  return {
+    requestDelayMs: normalizeRequestDelayMs(raw.requestDelayMs),
+    maxRetries: normalizeMaxRetries(raw.maxRetries),
+    continueOnError: raw.continueOnError === undefined
+      ? DEFAULT_SETTINGS.continueOnError
+      : Boolean(raw.continueOnError),
+    maxImageDimension: normalizeMaxImageDimension(raw.maxImageDimension),
+  };
+}
+
+function loadSettings() {
+  if (typeof GM_getValue !== 'function') {
+    return normalizeSettings(DEFAULT_SETTINGS);
+  }
+  return normalizeSettings(GM_getValue(SETTINGS_STORAGE_KEY, DEFAULT_SETTINGS));
+}
+
+function saveSettings(settings) {
+  const normalized = normalizeSettings(settings);
+  if (typeof GM_setValue === 'function') {
+    GM_setValue(SETTINGS_STORAGE_KEY, normalized);
+  }
+  return normalized;
+}
+
+function applySettingsToConfig(settings) {
+  CONFIG.requestDelayMs = settings.requestDelayMs;
+}
+
+function readReaderIdentityFromLocation() {
+  try {
+    const url = new URL(location.href);
+    return {
+      ssno: String(url.searchParams.get('ssno') || '').trim(),
+      channel: String(url.searchParams.get('channel') || '').trim(),
+    };
+  } catch {
+    return { ssno: '', channel: '' };
+  }
+}
+
+function buildLegacyJobKey(config) {
+  return `${location.origin}/jpath/${config.jpgPath}`;
+}
+
+function buildJobKey(config) {
+  const identity = readReaderIdentityFromLocation();
+  if (identity.ssno) {
+    return `${location.origin}::reader::ssno=${identity.ssno}::channel=${identity.channel || 'unknown'}`;
+  }
+  return buildLegacyJobKey(config);
+}
+
+function buildJobKeys(config) {
+  const keys = [];
+  const seen = new Set();
+  const add = (value) => {
+    const key = String(value || '').trim();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    keys.push(key);
+  };
+
+  add(buildJobKey(config));
+  add(buildLegacyJobKey(config));
+  return keys;
+}
+
+function buildPageKey(jobKey, totalPage) {
+  return `${jobKey}::${totalPage}`;
+}
+
+function requestToPromise(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('indexedDB request failed'));
+  });
+}
+
+function transactionToPromise(transaction) {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error || new Error('indexedDB transaction failed'));
+    transaction.onabort = () => reject(transaction.error || new Error('indexedDB transaction aborted'));
+  });
+}
+
+function openCacheDatabase() {
+  if (cacheDbPromise) return cacheDbPromise;
+
+  cacheDbPromise = new Promise((resolve, reject) => {
+    if (typeof indexedDB === 'undefined') {
+      reject(new Error('indexedDB unavailable'));
+      return;
+    }
+
+    const request = indexedDB.open(CACHE_DB_NAME, CACHE_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+
+      if (!db.objectStoreNames.contains(JOB_STORE_NAME)) {
+        db.createObjectStore(JOB_STORE_NAME, { keyPath: 'jobKey' });
+      }
+
+      if (!db.objectStoreNames.contains(PAGE_STORE_NAME)) {
+        const pageStore = db.createObjectStore(PAGE_STORE_NAME, { keyPath: 'pageKey' });
+        pageStore.createIndex('jobKey', 'jobKey', { unique: false });
+      }
+
+      if (!db.objectStoreNames.contains(BLOB_STORE_NAME)) {
+        db.createObjectStore(BLOB_STORE_NAME, { keyPath: 'blobKey' });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('indexedDB open failed'));
+  }).catch((error) => {
+    cacheDbPromise = null;
+    throw error;
+  });
+
+  return cacheDbPromise;
+}
+
+async function getStoreValue(storeName, key) {
+  const db = await openCacheDatabase();
+  const transaction = db.transaction(storeName, 'readonly');
+  const store = transaction.objectStore(storeName);
+  const result = await requestToPromise(store.get(key));
+  await transactionToPromise(transaction);
+  return result || null;
+}
+
+async function getIndexValues(storeName, indexName, key) {
+  const db = await openCacheDatabase();
+  const transaction = db.transaction(storeName, 'readonly');
+  const store = transaction.objectStore(storeName);
+  const result = await requestToPromise(store.index(indexName).getAll(IDBKeyRange.only(key)));
+  await transactionToPromise(transaction);
+  return Array.isArray(result) ? result : [];
+}
+
+async function getIndexValuesByKeys(storeName, indexName, keys) {
+  const values = [];
+  for (const key of keys) {
+    const result = await getIndexValues(storeName, indexName, key);
+    values.push(...result);
+  }
+  return values;
+}
+
+function sortPageMetasByJobKeyPriority(pageMetas, preferredKeys) {
+  const priority = new Map(preferredKeys.map((key, index) => [key, index]));
+  return pageMetas.slice().sort((a, b) => {
+    const aPriority = priority.has(a.jobKey) ? priority.get(a.jobKey) : Number.MAX_SAFE_INTEGER;
+    const bPriority = priority.has(b.jobKey) ? priority.get(b.jobKey) : Number.MAX_SAFE_INTEGER;
+    if (aPriority !== bPriority) return aPriority - bPriority;
+    return Number(b.updatedAt || 0) - Number(a.updatedAt || 0);
+  });
+}
+
+function dedupePageMetasByTotalPage(pageMetas, preferredKeys) {
+  const deduped = [];
+  const seen = new Set();
+  sortPageMetasByJobKeyPriority(pageMetas, preferredKeys).forEach((pageMeta) => {
+    const key = Number(pageMeta.totalPage || 0);
+    if (seen.has(key)) return;
+    seen.add(key);
+    deduped.push(pageMeta);
+  });
+  return deduped;
+}
+
+async function ensureJobRecord(state) {
+  const existing = await getStoreValue(JOB_STORE_NAME, state.jobKey);
+  const now = Date.now();
+  const nextRecord = {
+    jobKey: state.jobKey,
+    title: state.title,
+    jpgPath: state.jpgPath,
+    totalRows: state.rows.length,
+    updatedAt: now,
+    createdAt: existing && existing.createdAt ? existing.createdAt : now,
+  };
+
+  const db = await openCacheDatabase();
+  const transaction = db.transaction(JOB_STORE_NAME, 'readwrite');
+  transaction.objectStore(JOB_STORE_NAME).put(nextRecord);
+  await transactionToPromise(transaction);
+  return nextRecord;
+}
+
+function buildPageMeta(state, row, overrides) {
+  const pageKey = buildPageKey(state.jobKey, row.totalPage);
+  return {
+    pageKey,
+    blobKey: pageKey,
+    jobKey: state.jobKey,
+    totalPage: row.totalPage,
+    pageType: row.pageType,
+    pageTypeName: row.pageTypeName,
+    pageInType: row.pageInType,
+    fileName: row.fileName,
+    localUrl: row.localUrl,
+    redirectUrl: row.redirectUrl || '',
+    pid: row.pid || '',
+    lastErrorStage: row.lastErrorStage || '',
+    lastErrorMessage: row.lastErrorMessage || '',
+    updatedAt: Date.now(),
+    ...overrides,
+  };
+}
+
+async function storeSuccessfulPageCache(state, row, imageResponse, attemptsUsed) {
+  const pageMeta = buildPageMeta(state, row, {
+    downloadStatus: 'success',
+    attemptsUsed,
+    lastError: '',
+    contentType: imageResponse.contentType || '',
+    finalUrl: imageResponse.finalUrl || row.redirectUrl || '',
+    requestMode: imageResponse.requestMode || '',
+  });
+
+  const db = await openCacheDatabase();
+  const transaction = db.transaction([JOB_STORE_NAME, PAGE_STORE_NAME, BLOB_STORE_NAME], 'readwrite');
+  transaction.objectStore(JOB_STORE_NAME).put({
+    jobKey: state.jobKey,
+    title: state.title,
+    jpgPath: state.jpgPath,
+    totalRows: state.rows.length,
+    updatedAt: Date.now(),
+    createdAt: state.jobCreatedAt || Date.now(),
+  });
+  transaction.objectStore(PAGE_STORE_NAME).put(pageMeta);
+  transaction.objectStore(BLOB_STORE_NAME).put({
+    blobKey: pageMeta.blobKey,
+    blob: imageResponse.blob,
+    updatedAt: Date.now(),
+  });
+  await transactionToPromise(transaction);
+  return pageMeta;
+}
+
+async function storeFailedPageCache(state, row, attemptsUsed, lastError) {
+  const pageMeta = buildPageMeta(state, row, {
+    downloadStatus: 'error',
+    attemptsUsed,
+    lastError: normalizeErrorMessage(lastError),
+    contentType: '',
+    finalUrl: row.redirectUrl || '',
+    requestMode: '',
+  });
+
+  const db = await openCacheDatabase();
+  const transaction = db.transaction([JOB_STORE_NAME, PAGE_STORE_NAME, BLOB_STORE_NAME], 'readwrite');
+  transaction.objectStore(JOB_STORE_NAME).put({
+    jobKey: state.jobKey,
+    title: state.title,
+    jpgPath: state.jpgPath,
+    totalRows: state.rows.length,
+    updatedAt: Date.now(),
+    createdAt: state.jobCreatedAt || Date.now(),
+  });
+  transaction.objectStore(PAGE_STORE_NAME).put(pageMeta);
+  transaction.objectStore(BLOB_STORE_NAME).delete(pageMeta.blobKey);
+  await transactionToPromise(transaction);
+  return pageMeta;
+}
+
+async function getCachedPageBundle(jobKeys, totalPage) {
+  const keys = Array.isArray(jobKeys) ? jobKeys : [jobKeys];
+
+  for (const jobKey of keys) {
+    const pageKey = buildPageKey(jobKey, totalPage);
+    const [pageMeta, blobRecord] = await Promise.all([
+      getStoreValue(PAGE_STORE_NAME, pageKey),
+      getStoreValue(BLOB_STORE_NAME, pageKey),
+    ]);
+
+    if (!pageMeta) continue;
+    return {
+      pageMeta,
+      blob: blobRecord && blobRecord.blob ? blobRecord.blob : null,
+    };
+  }
+
+  return null;
+}
+
+function applyPageMetaToRow(row, pageMeta) {
+  if (!pageMeta) return row;
+  row.redirectUrl = pageMeta.redirectUrl || row.redirectUrl;
+  row.pid = pageMeta.pid || row.pid;
+  row.lastErrorStage = pageMeta.lastErrorStage || '';
+  row.lastErrorMessage = pageMeta.lastErrorMessage || '';
+  if (pageMeta.downloadStatus === 'success') {
+    row.status = 'cached';
+  } else if (pageMeta.downloadStatus === 'error') {
+    const stageLabel = getErrorStageLabel(pageMeta.lastErrorStage);
+    row.status = `缓存失败记录(${stageLabel}): ${pageMeta.lastErrorMessage || pageMeta.lastError || 'unknown'}`;
+  }
+  return row;
+}
+
+async function getJobCacheSummary(jobKeys, totalRows) {
+  const keys = Array.isArray(jobKeys) ? jobKeys : [jobKeys];
+  const rawPageMetas = await getIndexValuesByKeys(PAGE_STORE_NAME, 'jobKey', keys);
+  const pageMetas = dedupePageMetasByTotalPage(rawPageMetas, keys);
+  let cachedCount = 0;
+  let errorCount = 0;
+  let latestUpdatedAt = 0;
+
+  pageMetas.forEach((pageMeta) => {
+    latestUpdatedAt = Math.max(latestUpdatedAt, Number(pageMeta.updatedAt || 0));
+    if (pageMeta.downloadStatus === 'success') {
+      cachedCount += 1;
+    } else if (pageMeta.downloadStatus === 'error') {
+      errorCount += 1;
+    }
+  });
+
+  return {
+    totalRows,
+    cachedCount,
+    errorCount,
+    latestUpdatedAt,
+    pageMetas,
+  };
+}
+
+async function clearJobCache(jobKeys) {
+  const keys = Array.isArray(jobKeys) ? jobKeys : [jobKeys];
+  const pageMetas = await getIndexValuesByKeys(PAGE_STORE_NAME, 'jobKey', keys);
+  const db = await openCacheDatabase();
+  const transaction = db.transaction([JOB_STORE_NAME, PAGE_STORE_NAME, BLOB_STORE_NAME], 'readwrite');
+  const pageStore = transaction.objectStore(PAGE_STORE_NAME);
+  const blobStore = transaction.objectStore(BLOB_STORE_NAME);
+
+  pageMetas.forEach((pageMeta) => {
+    pageStore.delete(pageMeta.pageKey);
+    blobStore.delete(pageMeta.blobKey);
+  });
+  keys.forEach((jobKey) => {
+    transaction.objectStore(JOB_STORE_NAME).delete(jobKey);
+  });
+  await transactionToPromise(transaction);
+}
+
+function formatCacheSummary(summary) {
+  const cachedPart = `已缓存 ${summary.cachedCount}/${summary.totalRows} 页`;
+  if (summary.errorCount > 0) {
+    return `缓存: ${cachedPart}，失败 ${summary.errorCount} 页`;
+  }
+  return `缓存: ${cachedPart}`;
 }
 
 function extractChapterEntriesFromZTree(rows) {
@@ -438,23 +931,16 @@ function addPdfBookmarks(pdf, rows) {
   }
 }
 
-async function downloadRowsAsPdf(rows, progressEl, titlePrefix, rangeStart, rangeEnd) {
-  const JsPdfCtor = window.jspdf && window.jspdf.jsPDF;
-  if (!JsPdfCtor) {
-    throw new Error('jsPDF 未加载，无法导出 PDF');
-  }
-  if (rows.length === 0) {
-    throw new Error('没有可下载的页面');
-  }
-
-  let pdf = null;
+function createRequestThrottle() {
   let lastRequestAt = 0;
-  const throttle = async () => {
+
+  return async function throttle() {
     const delayMs = Math.max(0, Number(CONFIG.requestDelayMs) || 0);
     if (delayMs <= 0) {
       lastRequestAt = Date.now();
       return;
     }
+
     const now = Date.now();
     const waitMs = Math.max(0, lastRequestAt + delayMs - now);
     if (waitMs > 0) {
@@ -462,60 +948,232 @@ async function downloadRowsAsPdf(rows, progressEl, titlePrefix, rangeStart, rang
     }
     lastRequestAt = Date.now();
   };
+}
+
+function updateRowFromImageResponse(row, imageResponse) {
+  row.redirectUrl = imageResponse.finalUrl || row.redirectUrl;
+  const pid = extractPidFromUrl(imageResponse.finalUrl);
+  if (pid) {
+    row.pid = pid;
+  }
+  clearRowError(row);
+  row.status = 'ok';
+}
+
+async function tryGetCachedPreparedPage(state, row) {
+  try {
+    const cachedBundle = await getCachedPageBundle(state.jobKeys, row.totalPage);
+    if (!cachedBundle || !cachedBundle.pageMeta) return null;
+    applyPageMetaToRow(row, cachedBundle.pageMeta);
+    if (cachedBundle.pageMeta.downloadStatus !== 'success' || !cachedBundle.blob) {
+      return null;
+    }
+    return {
+      row,
+      blob: cachedBundle.blob,
+      source: 'cache',
+      attemptsUsed: Number(cachedBundle.pageMeta.attemptsUsed || 0),
+    };
+  } catch (error) {
+    console.warn('[xjtu-pdf-downloader] read cache failed', error);
+    return null;
+  }
+}
+
+async function tryStoreSuccessfulPreparedPage(state, row, imageResponse, attemptsUsed) {
+  try {
+    await storeSuccessfulPageCache(state, row, imageResponse, attemptsUsed);
+    return true;
+  } catch (error) {
+    console.warn('[xjtu-pdf-downloader] write cache failed', error);
+    return false;
+  }
+}
+
+async function tryStoreFailedPreparedPage(state, row, attemptsUsed, error) {
+  try {
+    await storeFailedPageCache(state, row, attemptsUsed, error);
+  } catch (storageError) {
+    console.warn('[xjtu-pdf-downloader] write failure cache failed', storageError);
+  }
+}
+
+async function downloadPreparedPage(state, row, throttle) {
+  let attemptsUsed = 0;
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= state.settings.maxRetries; attempt += 1) {
+    attemptsUsed = attempt + 1;
+    try {
+      await throttle();
+      const imageResponse = await requestRowImageBlob(row, CONFIG.requestTimeoutMs);
+      updateRowFromImageResponse(row, imageResponse);
+      const cached = await tryStoreSuccessfulPreparedPage(state, row, imageResponse, attemptsUsed);
+      row.status = cached ? 'cached' : 'ok';
+      return {
+        row,
+        blob: imageResponse.blob,
+        source: 'network',
+        attemptsUsed,
+      };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  setRowError(row, 'image', lastError || 'unknown');
+  await tryStoreFailedPreparedPage(state, row, attemptsUsed, lastError);
+  throw new Error(normalizeErrorMessage(lastError) || `第 ${row.totalPage} 页下载失败`);
+}
+
+async function preparePdfPages(rows, state, panel, throttle) {
+  const preparedPages = [];
+  const failedRows = [];
+  let cachedCount = 0;
+  let downloadedCount = 0;
 
   for (let i = 0; i < rows.length; i += 1) {
     const row = rows[i];
-    progressEl.textContent = `PDF 生成中 ${i + 1}/${rows.length}: 第 ${row.totalPage} 页`;
+    setPanelProgress(panel, `资源准备中 ${i + 1}/${rows.length}: 第 ${row.totalPage} 页`);
 
-    if (!row.redirectUrl && !row.pid) {
-      await throttle();
-      await resolvePid(row);
-    }
+    try {
+      const cachedPreparedPage = await tryGetCachedPreparedPage(state, row);
+      if (cachedPreparedPage) {
+        cachedCount += 1;
+        preparedPages.push(cachedPreparedPage);
+        continue;
+      }
 
-    const candidates = buildImageUrlCandidates(row);
-    let imageResp = null;
-    let lastError = '';
-    for (const candidateUrl of candidates) {
-      try {
-        await throttle();
-        const resp = await requestImageBlob(candidateUrl, CONFIG.requestTimeoutMs);
-        if (resp.contentType && !resp.contentType.startsWith('image/')) {
-          throw new Error(`non-image: ${resp.contentType}, final=${resp.finalUrl}`);
-        }
-        imageResp = resp;
-        break;
-      } catch (error) {
-        lastError = String(error);
+      const downloadedPreparedPage = await downloadPreparedPage(state, row, throttle);
+      downloadedCount += 1;
+      preparedPages.push(downloadedPreparedPage);
+    } catch (error) {
+      const failure = buildFailureRecord(row, 'image', error);
+      failedRows.push(failure);
+      if (!state.settings.continueOnError) {
+        throw new Error(formatFailureRecord(failure));
       }
     }
-
-    if (!imageResp) {
-      throw new Error(`第 ${row.totalPage} 页下载失败: ${lastError || 'unknown'}`);
-    }
-
-    const image = await loadImageFromBlob(imageResp.blob);
-    const width = image.naturalWidth;
-    const height = image.naturalHeight;
-    const orientation = width >= height ? 'landscape' : 'portrait';
-    const imageData = imageToJpegDataUrl(image, CONFIG.pdfImageQuality);
-
-    if (!pdf) {
-      pdf = new JsPdfCtor({
-        orientation,
-        unit: 'pt',
-        format: [width, height],
-        compress: true,
-      });
-    } else {
-      pdf.addPage([width, height], orientation);
-    }
-    pdf.addImage(imageData, 'JPEG', 0, 0, width, height, undefined, 'FAST');
   }
 
-  addPdfBookmarks(pdf, rows);
-  const fileName = `${sanitizeFileName(titlePrefix)}_${rangeStart}-${rangeEnd}.pdf`;
-  pdf.save(fileName);
-  progressEl.textContent = `PDF 下载已触发：${fileName}`;
+  return {
+    preparedPages,
+    failedRows,
+    cachedCount,
+    downloadedCount,
+  };
+}
+
+async function appendPreparedPagesToPdf(preparedPages, state, panel, failedRows) {
+  const JsPdfCtor = window.jspdf && window.jspdf.jsPDF;
+  if (!JsPdfCtor) {
+    throw new Error('jsPDF 未加载，无法导出 PDF');
+  }
+
+  let pdf = null;
+  const successfulRows = [];
+
+  for (let i = 0; i < preparedPages.length; i += 1) {
+    const preparedPage = preparedPages[i];
+    const row = preparedPage.row;
+    setPanelProgress(panel, `PDF 生成中 ${i + 1}/${preparedPages.length}: 第 ${row.totalPage} 页`);
+
+    try {
+      const image = await loadImageFromBlob(preparedPage.blob);
+      const rendered = renderImageToPdfCanvas(image, state.settings.maxImageDimension);
+      const orientation = rendered.width >= rendered.height ? 'landscape' : 'portrait';
+
+      if (!pdf) {
+        pdf = new JsPdfCtor({
+          orientation,
+          unit: 'pt',
+          format: [rendered.width, rendered.height],
+          compress: true,
+        });
+      } else {
+        pdf.addPage([rendered.width, rendered.height], orientation);
+      }
+
+      pdf.addImage(rendered.canvas, 'JPEG', 0, 0, rendered.width, rendered.height, undefined, 'FAST');
+      successfulRows.push(row);
+
+      image.src = '';
+      releaseCanvas(rendered.canvas);
+    } catch (error) {
+      setRowError(row, 'pdf', error);
+      const failure = buildFailureRecord(row, 'pdf', error);
+      failedRows.push(failure);
+      await tryStoreFailedPreparedPage(state, row, preparedPage.attemptsUsed, error);
+      if (!state.settings.continueOnError) {
+        throw new Error(formatFailureRecord(failure));
+      }
+    }
+  }
+
+  if (!pdf || successfulRows.length === 0) {
+    throw new Error('没有可导出的页面');
+  }
+
+  return { pdf, successfulRows };
+}
+
+function buildPdfFileName(titlePrefix, rangeStart, rangeEnd, failedRows) {
+  const partialSuffix = failedRows.length > 0 ? '_partial' : '';
+  return `${sanitizeFileName(titlePrefix)}_${rangeStart}-${rangeEnd}${partialSuffix}.pdf`;
+}
+
+function buildPdfCompletionMessage(fileName, successfulRows, failedRows, cachedCount, downloadedCount) {
+  const parts = [
+    `PDF 下载已触发：${fileName}`,
+    `成功 ${successfulRows.length} 页`,
+    `失败 ${failedRows.length} 页`,
+    `缓存复用 ${cachedCount} 页`,
+    `新下载 ${downloadedCount} 页`,
+  ];
+
+  if (failedRows.length > 0) {
+    parts.push(`失败分布: ${formatFailureStageSummary(failedRows)}`);
+    parts.push(`首个失败: ${formatFailureRecord(failedRows[0])}`);
+  }
+
+  return parts.join('，');
+}
+
+async function downloadRowsAsPdf(rows, state, panel, rangeStart, rangeEnd) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    throw new Error('没有可下载的页面');
+  }
+
+  const throttle = createRequestThrottle();
+  const preparation = await preparePdfPages(rows, state, panel, throttle);
+  if (preparation.preparedPages.length === 0) {
+    throw new Error(preparation.failedRows[0] ? formatFailureRecord(preparation.failedRows[0]) : '没有可导出的页面');
+  }
+
+  const failedRows = preparation.failedRows.slice();
+  const pdfResult = await appendPreparedPagesToPdf(preparation.preparedPages, state, panel, failedRows);
+  addPdfBookmarks(pdfResult.pdf, pdfResult.successfulRows);
+
+  const fileName = buildPdfFileName(state.title, rangeStart, rangeEnd, failedRows);
+  pdfResult.pdf.save(fileName);
+  setPanelProgress(
+    panel,
+    buildPdfCompletionMessage(
+      fileName,
+      pdfResult.successfulRows,
+      failedRows,
+      preparation.cachedCount,
+      preparation.downloadedCount,
+    ),
+  );
+
+  return {
+    fileName,
+    successfulRows: pdfResult.successfulRows,
+    failedRows,
+    cachedCount: preparation.cachedCount,
+    downloadedCount: preparation.downloadedCount,
+  };
 }
 
 function parseInlineReaderConfig() {
@@ -572,6 +1230,8 @@ function buildPageMap(pages, jpgPath) {
         localUrl,
         redirectUrl: '',
         pid: '',
+        lastErrorStage: '',
+        lastErrorMessage: '',
         status: 'pending',
       });
 
@@ -584,23 +1244,30 @@ function buildPageMap(pages, jpgPath) {
 
 async function resolvePid(row) {
   try {
-    const response = await requestWithRedirectInfo(row.localUrl, CONFIG.requestTimeoutMs);
+    const response = await requestReaderResource(row.localUrl, CONFIG.requestTimeoutMs);
     const finalUrl = response.finalUrl || '';
     row.redirectUrl = finalUrl;
 
     if (!finalUrl) {
-      row.status = `http-${response.status || 'unknown'}`;
+      setRowError(row, 'pid', `未获取到 finalUrl (HTTP ${response.status || 'unknown'})`);
       return row;
     }
 
     const remoteUrl = new URL(finalUrl, location.href);
     row.pid = remoteUrl.searchParams.get('pid') || '';
-    row.status = finalUrl.includes('/png/png.dll?')
-      ? (row.pid ? 'ok' : 'no-pid')
-      : `final:${remoteUrl.pathname}`;
+    if (!finalUrl.includes('/png/png.dll?')) {
+      setRowError(row, 'pid', `最终地址不是 png.dll: ${remoteUrl.pathname}`);
+      return row;
+    }
+    if (!row.pid) {
+      setRowError(row, 'pid', '最终地址中未找到 pid');
+      return row;
+    }
+    clearRowError(row);
+    row.status = 'pid-ok';
     return row;
   } catch (error) {
-    row.status = `error: ${String(error)}`;
+    setRowError(row, 'pid', error);
     return row;
   }
 }
@@ -647,17 +1314,32 @@ function summarisePidRanges(rows) {
   return ranges;
 }
 
-function createPanel(data, totalRows) {
-  const existing = document.getElementById('tm-reader-pid-panel');
-  if (existing) existing.remove();
+function createPanelLauncher() {
+  const launcher = document.createElement('button');
+  launcher.id = 'tm-panel-launcher';
+  launcher.type = 'button';
+  launcher.textContent = '打开下载面板';
+  launcher.style.cssText = [
+    'display:inline-flex',
+    'align-items:center',
+    'justify-content:center',
+    'padding:8px 12px',
+    'border:1px solid #d0d7de',
+    'border-radius:999px',
+    'background:#fff',
+    'box-shadow:0 8px 24px rgba(0,0,0,0.14)',
+    'font:12px/1.2 monospace',
+    'color:#24292f',
+    'cursor:pointer',
+  ].join(';');
+  return launcher;
+}
 
-  const panel = document.createElement('div');
+function createPanelContainer(title, totalRows, settings) {
+  const panel = document.createElement('section');
   panel.id = 'tm-reader-pid-panel';
+  panel.hidden = true;
   panel.style.cssText = [
-    'position:fixed',
-    'top:16px',
-    'right:16px',
-    'z-index:999999',
     'width:560px',
     'max-height:82vh',
     'overflow:auto',
@@ -671,26 +1353,126 @@ function createPanel(data, totalRows) {
   ].join(';');
 
   panel.innerHTML = `
-    <div style="font-weight:700;font-size:13px;margin-bottom:8px;">阅读器调试面板</div>
-    <div><b>书名:</b> ${escapeHtml(document.title || '未知书名')}</div>
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;">
+      <div style="font-weight:700;font-size:13px;">XJTUPdfDownloader</div>
+      <button id="tm-panel-close" type="button" style="padding:4px 8px;cursor:pointer;">收起</button>
+    </div>
+    <div><b>书名:</b> ${escapeHtml(title || '未知书名')}</div>
     <div style="margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
       <span><b>限速:</b></span>
-      <input id="tm-request-delay" type="number" min="0" max="60000" step="50" value="${CONFIG.requestDelayMs}" style="width:90px;" />
+      <input id="tm-request-delay" type="number" min="0" max="60000" step="50" value="${settings.requestDelayMs}" style="width:90px;" />
       <span>ms/请求（PID 解析 + PDF 下载）</span>
     </div>
-    <div style="margin-top:2px;color:#57606a;">默认只解析前 ${CONFIG.initialBatchSize} 页</div>
+    <div style="margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+      <span><b>失败重试:</b></span>
+      <input id="tm-max-retries" type="number" min="0" max="5" step="1" value="${settings.maxRetries}" style="width:70px;" />
+      <label style="display:inline-flex;align-items:center;gap:4px;">
+        <input id="tm-continue-on-error" type="checkbox" ${settings.continueOnError ? 'checked' : ''} />
+        <span>失败后继续生成 PDF</span>
+      </label>
+    </div>
+    <div style="margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+      <span><b>最大边长:</b></span>
+      <input id="tm-max-image-dimension" type="number" min="0" max="10000" step="100" value="${settings.maxImageDimension}" style="width:90px;" />
+      <span>px，0 表示保持原始尺寸</span>
+    </div>
+    <div id="tm-cache-summary" style="margin-top:8px;color:#57606a;">缓存: 读取中...</div>
     <div id="tm-progress" style="margin-top:8px;color:#57606a;">准备就绪</div>
     <div style="margin-top:8px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
       <span>PDF 页码范围:</span>
       <input id="tm-pdf-start" type="number" min="1" value="1" style="width:70px;" />
       <span>-</span>
       <input id="tm-pdf-end" type="number" min="1" value="${totalRows}" style="width:70px;" />
-      <button id="tm-download-pdf">下载 PDF</button>
+      <button id="tm-download-pdf" type="button" style="padding:4px 8px;cursor:pointer;">下载 PDF</button>
+      <button id="tm-clear-cache" type="button" style="padding:4px 8px;cursor:pointer;">清理当前书缓存</button>
     </div>
   `;
 
-  document.body.appendChild(panel);
   return panel;
+}
+
+function createPanel(title, totalRows, settings) {
+  const existing = document.getElementById('tm-reader-pid-root');
+  if (existing) existing.remove();
+
+  const root = document.createElement('div');
+  root.id = 'tm-reader-pid-root';
+  root.style.cssText = [
+    'position:fixed',
+    'top:16px',
+    'right:16px',
+    'z-index:999999',
+    'display:flex',
+    'flex-direction:column',
+    'align-items:flex-end',
+    'gap:8px',
+  ].join(';');
+
+  const launcherEl = createPanelLauncher();
+  const panelEl = createPanelContainer(title, totalRows, settings);
+  root.appendChild(launcherEl);
+  root.appendChild(panelEl);
+
+  document.body.appendChild(root);
+
+  const panel = {
+    rootEl: root,
+    launcherEl,
+    panelEl,
+    collapseButton: panelEl.querySelector('#tm-panel-close'),
+    cacheSummaryEl: panelEl.querySelector('#tm-cache-summary'),
+    progressEl: panelEl.querySelector('#tm-progress'),
+    requestDelayInput: panelEl.querySelector('#tm-request-delay'),
+    maxRetriesInput: panelEl.querySelector('#tm-max-retries'),
+    continueOnErrorInput: panelEl.querySelector('#tm-continue-on-error'),
+    maxImageDimensionInput: panelEl.querySelector('#tm-max-image-dimension'),
+    pdfStartInput: panelEl.querySelector('#tm-pdf-start'),
+    pdfEndInput: panelEl.querySelector('#tm-pdf-end'),
+    downloadButton: panelEl.querySelector('#tm-download-pdf'),
+    clearCacheButton: panelEl.querySelector('#tm-clear-cache'),
+  };
+
+  setPanelCollapsed(panel, true);
+  setPanelBusy(panel, false);
+  return panel;
+}
+
+function setPanelCollapsed(panel, collapsed) {
+  panel.launcherEl.hidden = !collapsed;
+  panel.panelEl.hidden = collapsed;
+}
+
+function setPanelProgress(panel, message) {
+  panel.progressEl.textContent = String(message || '');
+}
+
+function setPanelCacheSummary(panel, message) {
+  panel.cacheSummaryEl.textContent = String(message || '');
+}
+
+function setPanelBusy(panel, busy) {
+  panel.collapseButton.disabled = !!busy;
+  panel.requestDelayInput.disabled = !!busy;
+  panel.maxRetriesInput.disabled = !!busy;
+  panel.continueOnErrorInput.disabled = !!busy;
+  panel.maxImageDimensionInput.disabled = !!busy;
+  panel.pdfStartInput.disabled = !!busy;
+  panel.pdfEndInput.disabled = !!busy;
+  panel.downloadButton.disabled = !!busy;
+  panel.clearCacheButton.disabled = !!busy;
+  panel.downloadButton.textContent = busy ? '下载中...' : '下载 PDF';
+}
+
+function syncPanelRangeInputs(panel, startPage, endPage) {
+  panel.pdfStartInput.value = String(startPage);
+  panel.pdfEndInput.value = String(endPage);
+}
+
+function syncPanelSettings(panel, settings) {
+  panel.requestDelayInput.value = String(settings.requestDelayMs);
+  panel.maxRetriesInput.value = String(settings.maxRetries);
+  panel.continueOnErrorInput.checked = !!settings.continueOnError;
+  panel.maxImageDimensionInput.value = String(settings.maxImageDimension);
 }
 
 function renderRanges(container, rows) {
@@ -749,7 +1531,6 @@ function renderTable(container, rows) {
       </thead>
       <tbody>${html}</tbody>
     </table>
-    ${rows.length > CONFIG.maxRowsRendered ? `<div style="margin-top:6px;color:#57606a;">仅渲染前 ${CONFIG.maxRowsRendered} 行，完整数据请复制 JSON。</div>` : ''}
   `;
 }
 
@@ -770,81 +1551,232 @@ function exposeDebugState(state) {
   console.log('[reader-debug] page/pid map', state);
 }
 
-function main() {
-  const config = parseInlineReaderConfig();
-  if (!config) return;
-
+function createAppState(config, settings) {
   const rows = buildPageMap(config.pages, config.jpgPath);
-  const state = {
+  return {
     title: document.title,
     jpgPath: config.jpgPath,
     waterMark: config.waterMark,
     pages: config.pages,
     rows,
+    jobKey: buildJobKey(config),
+    jobKeys: buildJobKeys(config),
+    jobCreatedAt: null,
+    settings,
+    cacheSummary: null,
+    lastDownloadReport: null,
     extractor: 'GM_xmlhttpRequest.finalUrl',
     config: CONFIG,
+    ui: {
+      collapsed: true,
+      isDownloading: false,
+    },
   };
+}
 
-  const panel = createPanel(config, rows.length);
-  const progressEl = panel.querySelector('#tm-progress');
-  const requestDelayInput = panel.querySelector('#tm-request-delay');
-  const pdfStartInput = panel.querySelector('#tm-pdf-start');
-  const pdfEndInput = panel.querySelector('#tm-pdf-end');
-
-  const applyRequestDelay = (showMessage) => {
-    const nextDelay = normalizeRequestDelayMs(requestDelayInput.value);
-    CONFIG.requestDelayMs = nextDelay;
-    requestDelayInput.value = String(nextDelay);
-    if (showMessage) {
-      progressEl.textContent = `限速已更新：${nextDelay}ms/请求`;
-    }
-    return nextDelay;
+function readPanelSettings(panel) {
+  return {
+    requestDelayMs: panel.requestDelayInput.value,
+    maxRetries: panel.maxRetriesInput.value,
+    continueOnError: panel.continueOnErrorInput.checked,
+    maxImageDimension: panel.maxImageDimensionInput.value,
   };
+}
 
-  exposeDebugState(state);
-
-  requestDelayInput.addEventListener('change', () => {
-    applyRequestDelay(true);
+function persistSettingsFromPanel(state, panel, message) {
+  state.settings = saveSettings({
+    ...state.settings,
+    ...readPanelSettings(panel),
   });
+  applySettingsToConfig(state.settings);
+  syncPanelSettings(panel, state.settings);
+  if (message) {
+    setPanelProgress(panel, message);
+  }
+  return state.settings;
+}
 
-  requestDelayInput.addEventListener('blur', () => {
-    applyRequestDelay(true);
-  });
+function setAppPanelCollapsed(state, panel, collapsed) {
+  state.ui.collapsed = collapsed;
+  setPanelCollapsed(panel, collapsed);
+}
 
-  panel.querySelector('#tm-download-pdf').addEventListener('click', async () => {
-    applyRequestDelay(false);
-    const startPage = Number.parseInt(pdfStartInput.value, 10);
-    const endPage = Number.parseInt(pdfEndInput.value, 10);
-    const minPage = 1;
-    const maxPage = rows.length;
-
-    if (!Number.isInteger(startPage) || !Number.isInteger(endPage)) {
-      progressEl.textContent = 'PDF 页码范围无效';
-      return;
-    }
-
-    const safeStart = Math.max(minPage, Math.min(startPage, maxPage));
-    const safeEnd = Math.max(minPage, Math.min(endPage, maxPage));
-    if (safeStart > safeEnd) {
-      progressEl.textContent = '起始页不能大于结束页';
-      return;
-    }
-
-    pdfStartInput.value = String(safeStart);
-    pdfEndInput.value = String(safeEnd);
-
-    const selectedRows = rows.slice(safeStart - 1, safeEnd);
-    try {
-      await downloadRowsAsPdf(selectedRows, progressEl, document.title, safeStart, safeEnd);
-    } catch (error) {
-      progressEl.textContent = `PDF 生成失败: ${String(error)}`;
-    }
+function resetRowsToPending(rows) {
+  rows.forEach((row) => {
+    row.redirectUrl = '';
+    row.pid = '';
+    clearRowError(row);
+    row.status = 'pending';
   });
 }
 
+async function refreshCacheSummary(state, panel) {
+  try {
+    const jobRecord = await ensureJobRecord(state);
+    state.jobCreatedAt = jobRecord.createdAt;
+    const summary = await getJobCacheSummary(state.jobKeys, state.rows.length);
+    state.cacheSummary = summary;
+    resetRowsToPending(state.rows);
+    summary.pageMetas.forEach((pageMeta) => {
+      const row = state.rows.find((item) => item.totalPage === pageMeta.totalPage);
+      if (row) {
+        applyPageMetaToRow(row, pageMeta);
+      }
+    });
+    setPanelCacheSummary(panel, formatCacheSummary(summary));
+  } catch (error) {
+    state.cacheSummary = null;
+    setPanelCacheSummary(panel, `缓存: 不可用 (${normalizeErrorMessage(error)})`);
+  }
+}
+
+function getRequestedPdfRange(panel, totalRows) {
+  const startPage = Number.parseInt(panel.pdfStartInput.value, 10);
+  const endPage = Number.parseInt(panel.pdfEndInput.value, 10);
+  const minPage = 1;
+  const maxPage = totalRows;
+
+  if (!Number.isInteger(startPage) || !Number.isInteger(endPage)) {
+    return { error: 'PDF 页码范围无效' };
+  }
+
+  const safeStart = Math.max(minPage, Math.min(startPage, maxPage));
+  const safeEnd = Math.max(minPage, Math.min(endPage, maxPage));
+  if (safeStart > safeEnd) {
+    return { error: '起始页不能大于结束页' };
+  }
+
+  return { safeStart, safeEnd };
+}
+
+async function handlePdfDownload(state, panel) {
+  if (state.ui.isDownloading) return;
+
+  persistSettingsFromPanel(state, panel, '');
+  const range = getRequestedPdfRange(panel, state.rows.length);
+  if (range.error) {
+    setPanelProgress(panel, range.error);
+    return;
+  }
+
+  syncPanelRangeInputs(panel, range.safeStart, range.safeEnd);
+  state.ui.isDownloading = true;
+  setPanelBusy(panel, true);
+
+  const selectedRows = state.rows.slice(range.safeStart - 1, range.safeEnd);
+  try {
+    state.lastDownloadReport = await downloadRowsAsPdf(
+      selectedRows,
+      state,
+      panel,
+      range.safeStart,
+      range.safeEnd,
+    );
+    await refreshCacheSummary(state, panel);
+  } catch (error) {
+    state.lastDownloadReport = {
+      fileName: '',
+      successfulRows: [],
+      failedRows: [],
+      cachedCount: 0,
+      downloadedCount: 0,
+      fatalError: normalizeErrorMessage(error),
+    };
+    setPanelProgress(panel, `PDF 生成失败: ${normalizeErrorMessage(error)}`);
+    await refreshCacheSummary(state, panel);
+  } finally {
+    state.ui.isDownloading = false;
+    setPanelBusy(panel, false);
+  }
+}
+
+async function handleClearCache(state, panel) {
+  if (state.ui.isDownloading) return;
+
+  setPanelBusy(panel, true);
+  setPanelProgress(panel, '正在清理当前书缓存...');
+  try {
+    await clearJobCache(state.jobKeys);
+    resetRowsToPending(state.rows);
+    await refreshCacheSummary(state, panel);
+    setPanelProgress(panel, '当前书缓存已清理');
+  } catch (error) {
+    setPanelProgress(panel, `清理缓存失败: ${normalizeErrorMessage(error)}`);
+  } finally {
+    setPanelBusy(panel, false);
+  }
+}
+
+function bindPanelEvents(state, panel) {
+  panel.launcherEl.addEventListener('click', () => {
+    setAppPanelCollapsed(state, panel, false);
+  });
+
+  panel.collapseButton.addEventListener('click', () => {
+    setAppPanelCollapsed(state, panel, true);
+  });
+
+  panel.requestDelayInput.addEventListener('change', () => {
+    persistSettingsFromPanel(state, panel, '设置已保存');
+  });
+
+  panel.requestDelayInput.addEventListener('blur', () => {
+    persistSettingsFromPanel(state, panel, '设置已保存');
+  });
+
+  panel.maxRetriesInput.addEventListener('change', () => {
+    persistSettingsFromPanel(state, panel, '设置已保存');
+  });
+
+  panel.maxRetriesInput.addEventListener('blur', () => {
+    persistSettingsFromPanel(state, panel, '设置已保存');
+  });
+
+  panel.continueOnErrorInput.addEventListener('change', () => {
+    persistSettingsFromPanel(state, panel, '设置已保存');
+  });
+
+  panel.maxImageDimensionInput.addEventListener('change', () => {
+    persistSettingsFromPanel(state, panel, '设置已保存');
+  });
+
+  panel.maxImageDimensionInput.addEventListener('blur', () => {
+    persistSettingsFromPanel(state, panel, '设置已保存');
+  });
+
+  panel.downloadButton.addEventListener('click', async () => {
+    await handlePdfDownload(state, panel);
+  });
+
+  panel.clearCacheButton.addEventListener('click', async () => {
+    await handleClearCache(state, panel);
+  });
+}
+
+async function main() {
+  const config = parseInlineReaderConfig();
+  if (!config) return;
+
+  const settings = loadSettings();
+  applySettingsToConfig(settings);
+
+  const state = createAppState(config, settings);
+  const panel = createPanel(state.title, state.rows.length, state.settings);
+  syncPanelSettings(panel, state.settings);
+  exposeDebugState(state);
+  bindPanelEvents(state, panel);
+  await refreshCacheSummary(state, panel);
+}
+
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', main, { once: true });
+  document.addEventListener('DOMContentLoaded', () => {
+    main().catch((error) => {
+      console.error('[xjtu-pdf-downloader] bootstrap failed', error);
+    });
+  }, { once: true });
 } else {
-  main();
+  main().catch((error) => {
+    console.error('[xjtu-pdf-downloader] bootstrap failed', error);
+  });
 }
 })();

@@ -1,0 +1,21 @@
+{
+  "name": "xjtu-pdf-downloader",
+  "version": "0.6.0",
+  "private": true,
+  "description": "Tampermonkey userscript for mapping reader page resources and exporting selected ranges to PDF.",
+  "license": "LGPL-3.0-only",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "node scripts/build-xjtu-pdf-downloader.js",
+    "check:bundle": "node -c XJTUPdfDownloader.js && node -c dist/XJTUPdfDownloader.user.js",
+    "check:version": "node scripts/check-version-sync.js",
+    "check:generated": "node scripts/check-generated-files.js",
+    "verify": "npm run build && npm run check:version && npm run check:bundle && npm run check:generated",
+    "version:sync": "node scripts/sync-version.js",
+    "release:verify": "npm run verify",
+    "preversion": "npm run verify",
+    "version": "npm run version:sync && npm run build && npm run check:version && npm run check:bundle"
+  }
+}

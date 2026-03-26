@@ -9,6 +9,7 @@ This directory stores the maintainable source parts for the userscript.
 - `parts/02_constants.js`: shared config/constants
 - `parts/03_utils.js`: utility helpers
 - `parts/04_network.js`: request and blob helpers
+- `parts/04a_storage.js`: settings persistence + IndexedDB cache helpers
 - `parts/05_bookmarks.js`: PDF bookmark extraction/build logic
 - `parts/06_pdf_download.js`: PDF download pipeline
 - `parts/07_reader_mapping.js`: page map + PID resolve logic
@@ -20,10 +21,18 @@ This directory stores the maintainable source parts for the userscript.
 From repo root:
 
 ```bash
-node scripts/build-xjtu-pdf-downloader.js
+npm run build
 ```
 
 Outputs:
 
 - `XJTUPdfDownloader.js`
 - `dist/XJTUPdfDownloader.user.js`
+
+## Verify
+
+From repo root:
+
+```bash
+npm run verify
+```

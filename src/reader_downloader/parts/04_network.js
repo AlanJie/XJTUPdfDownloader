@@ -1,32 +1,14 @@
-function requestWithRedirectInfo(url, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    GM_xmlhttpRequest({
-      method: 'GET',
-      url,
-      timeout: timeoutMs,
-      anonymous: false,
-      withCredentials: true,
-      redirect: 'follow',
-      onload(response) {
-        resolve(response);
-      },
-      ontimeout() {
-        reject(new Error(`timeout after ${timeoutMs}ms`));
-      },
-      onerror(error) {
-        reject(error instanceof Error ? error : new Error(String(error)));
-      },
-    });
-  });
+function buildReaderRequestHeaders(extraHeaders) {
+  return {
+    // png.dll 在缺少 Referer 时常返回 200 + 空包，这里显式带上来源页。
+    Referer: location.href,
+    Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+    ...(extraHeaders || {}),
+  };
 }
 
-function parseHeaderValue(headersText, headerName) {
-  const text = String(headersText || '');
-  const match = text.match(new RegExp(`^${headerName}:\\s*([^\\r\\n;]+)`, 'im'));
-  return match ? match[1].trim() : '';
-}
-
-function requestRaw(url, timeoutMs, mode) {
+function buildRequestOptions(url, timeoutMs, options) {
+  const nextOptions = options || {};
   const requestOptions = {
     method: 'GET',
     url,
@@ -34,21 +16,25 @@ function requestRaw(url, timeoutMs, mode) {
     anonymous: false,
     withCredentials: true,
     redirect: 'follow',
-    headers: {
-      // png.dll 在缺少 Referer 时常返回 200 + 空包，这里显式带上来源页。
-      Referer: location.href,
-      Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
-    },
   };
 
-  if (mode === 'arraybuffer') {
+  if (nextOptions.headers && Object.keys(nextOptions.headers).length > 0) {
+    requestOptions.headers = nextOptions.headers;
+  }
+
+  if (nextOptions.mode === 'arraybuffer') {
     requestOptions.responseType = 'arraybuffer';
-  } else if (mode === 'blob') {
+  } else if (nextOptions.mode === 'blob') {
     requestOptions.responseType = 'blob';
-  } else if (mode === 'binary-text') {
+  } else if (nextOptions.mode === 'binary-text') {
     requestOptions.overrideMimeType = 'text/plain; charset=x-user-defined';
   }
 
+  return requestOptions;
+}
+
+function requestGet(url, timeoutMs, options) {
+  const requestOptions = buildRequestOptions(url, timeoutMs, options);
   return new Promise((resolve, reject) => {
     GM_xmlhttpRequest({
       ...requestOptions,
@@ -63,6 +49,20 @@ function requestRaw(url, timeoutMs, mode) {
       },
     });
   });
+}
+
+function requestReaderResource(url, timeoutMs, options) {
+  const nextOptions = options || {};
+  return requestGet(url, timeoutMs, {
+    ...nextOptions,
+    headers: buildReaderRequestHeaders(nextOptions.headers),
+  });
+}
+
+function parseHeaderValue(headersText, headerName) {
+  const text = String(headersText || '');
+  const match = text.match(new RegExp(`^${headerName}:\\s*([^\\r\\n;]+)`, 'im'));
+  return match ? match[1].trim() : '';
 }
 
 function binaryTextToBlob(binaryText, contentType) {
@@ -110,6 +110,17 @@ function normalizePngUrl(row) {
   return '';
 }
 
+function extractPidFromUrl(url) {
+  const text = String(url || '').trim();
+  if (!text) return '';
+  try {
+    const parsed = new URL(text, location.href);
+    return parsed.searchParams.get('pid') || '';
+  } catch {
+    return '';
+  }
+}
+
 function buildImageUrlCandidates(row) {
   const candidates = [];
   const seen = new Set();
@@ -130,7 +141,7 @@ async function requestImageBlob(url, timeoutMs) {
 
   for (const mode of CONFIG.pdfRequestRetryModes) {
     try {
-      const response = await requestRaw(url, timeoutMs, mode);
+      const response = await requestReaderResource(url, timeoutMs, { mode });
       const status = Number(response.status || 0);
       if (status < 200 || status >= 300) {
         errors.push(`${mode}:http-${status || 'unknown'}`);
@@ -156,6 +167,22 @@ async function requestImageBlob(url, timeoutMs) {
   }
 
   throw new Error(`image request failed: ${errors.join(' | ')}`);
+}
+
+async function requestRowImageBlob(row, timeoutMs) {
+  const candidates = buildImageUrlCandidates(row);
+  const candidateErrors = [];
+
+  for (const candidateUrl of candidates) {
+    try {
+      return await requestImageBlob(candidateUrl, timeoutMs);
+    } catch (error) {
+      const candidateType = candidateUrl === row.localUrl ? 'reader-url' : 'png-url';
+      candidateErrors.push(`${candidateType}: ${normalizeErrorMessage(error)}`);
+    }
+  }
+
+  throw new Error(candidateErrors.join(' | ') || 'image request failed');
 }
 
 function loadImageFromBlob(blob) {

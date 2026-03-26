@@ -1,9 +1,7 @@
 const CONFIG = {
   requestDelayMs: 200,
-  initialBatchSize: 12,
   requestTimeoutMs: 12000,
   maxRowsRendered: 400,
-  pdfImageQuality: 0.92,
   pdfRequestRetryModes: ['arraybuffer', 'blob', 'binary-text'],
 };
 

@@ -65,14 +65,20 @@
 - 支持用户脚本的浏览器扩展，例如 Tampermonkey
 - 已登录目标教材平台，并能打开阅读器页面
 
-这个项目没有 `npm` 依赖；构建脚本直接使用 Node.js 内置模块。
+这个项目没有运行时 `npm` 依赖，但现在提供了统一的 `package.json` 脚本，用于本地构建、校验和发版。
 
 ## 构建
 
-在仓库根目录执行：
+首次进入仓库后：
 
 ```bash
-node scripts/build-xjtu-pdf-downloader.js
+npm ci
+```
+
+日常构建：
+
+```bash
+npm run build
 ```
 
 默认会生成两个文件：
@@ -87,6 +93,58 @@ node scripts/build-xjtu-pdf-downloader.js ./out/XJTUPdfDownloader.js
 ```
 
 无论是否指定自定义输出，`dist/XJTUPdfDownloader.user.js` 都会同时刷新。
+
+## 校验
+
+在提交前，推荐执行：
+
+```bash
+npm run verify
+```
+
+这个命令会依次完成：
+
+- 重新构建 userscript
+- 检查 `package.json` 版本号和 userscript 头中的 `@version` 是否一致
+- 检查生成产物语法
+- 检查 `XJTUPdfDownloader.js` 与 `dist/XJTUPdfDownloader.user.js` 是否已经同步到最新源码
+
+## 发布
+
+### 本地发版
+
+推荐使用 `npm version` 管理版本号。例如：
+
+```bash
+npm version patch
+```
+
+这会自动：
+
+- 更新 `package.json` 版本
+- 同步 userscript 头里的 `@version`
+- 重建产物
+- 校验版本与 bundle
+
+如果要发布到 GitHub：
+
+```bash
+git push
+git push --follow-tags
+```
+
+### GitHub Actions
+
+仓库内置了两条 GitHub Actions 工作流：
+
+- `CI`
+  触发时机：`push` 到 `main` 或 `pull_request`
+  作用：执行 `npm ci` 和 `npm run verify`
+- `Release`
+  触发时机：推送 `v*` 标签
+  作用：校验标签版本是否匹配 `package.json`，然后自动创建 GitHub Release，并上传：
+  - `XJTUPdfDownloader.js`
+  - `dist/XJTUPdfDownloader.user.js`
 
 ## 安装与使用
 

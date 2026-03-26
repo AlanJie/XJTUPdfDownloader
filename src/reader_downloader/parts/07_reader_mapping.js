@@ -52,6 +52,8 @@ function buildPageMap(pages, jpgPath) {
         localUrl,
         redirectUrl: '',
         pid: '',
+        lastErrorStage: '',
+        lastErrorMessage: '',
         status: 'pending',
       });
 
@@ -64,23 +66,30 @@ function buildPageMap(pages, jpgPath) {
 
 async function resolvePid(row) {
   try {
-    const response = await requestWithRedirectInfo(row.localUrl, CONFIG.requestTimeoutMs);
+    const response = await requestReaderResource(row.localUrl, CONFIG.requestTimeoutMs);
     const finalUrl = response.finalUrl || '';
     row.redirectUrl = finalUrl;
 
     if (!finalUrl) {
-      row.status = `http-${response.status || 'unknown'}`;
+      setRowError(row, 'pid', `未获取到 finalUrl (HTTP ${response.status || 'unknown'})`);
       return row;
     }
 
     const remoteUrl = new URL(finalUrl, location.href);
     row.pid = remoteUrl.searchParams.get('pid') || '';
-    row.status = finalUrl.includes('/png/png.dll?')
-      ? (row.pid ? 'ok' : 'no-pid')
-      : `final:${remoteUrl.pathname}`;
+    if (!finalUrl.includes('/png/png.dll?')) {
+      setRowError(row, 'pid', `最终地址不是 png.dll: ${remoteUrl.pathname}`);
+      return row;
+    }
+    if (!row.pid) {
+      setRowError(row, 'pid', '最终地址中未找到 pid');
+      return row;
+    }
+    clearRowError(row);
+    row.status = 'pid-ok';
     return row;
   } catch (error) {
-    row.status = `error: ${String(error)}`;
+    setRowError(row, 'pid', error);
     return row;
   }
 }

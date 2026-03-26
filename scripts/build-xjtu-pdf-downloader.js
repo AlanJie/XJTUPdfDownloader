@@ -5,8 +5,8 @@ const path = require('node:path');
 
 const rootDir = path.resolve(__dirname, '..');
 const partsDir = path.join(rootDir, 'src', 'reader_downloader', 'parts');
-const defaultOutput = path.join(rootDir, 'ReaderDownloader.js');
-const distOutput = path.join(rootDir, 'dist', 'ReaderDownloader.user.js');
+const defaultOutput = path.join(rootDir, 'XJTUPdfDownloader.js');
+const distOutput = path.join(rootDir, 'dist', 'XJTUPdfDownloader.user.js');
 
 const cliOutput = process.argv[2]
   ? path.resolve(rootDir, process.argv[2])

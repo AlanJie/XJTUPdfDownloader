@@ -1,6 +1,6 @@
-# libScripts / ReaderDownloader
+# XJTUPdfDownloader
 
-这个仓库当前主要包含一个面向西安交通大学教材平台阅读器页面的 Tampermonkey 用户脚本：`ReaderDownloader`。
+这个仓库当前主要包含一个面向西安交通大学教材平台阅读器页面的 Tampermonkey 用户脚本：`XJTUPdfDownloader`。
 
 它的目标是从阅读器页提取内联配置，建立页面文件名映射，利用图片请求的重定向结果解析 `png.dll?pid=...`，并按指定页码范围抓取页面图片、合成为 PDF。
 
@@ -37,11 +37,11 @@
 
 ```text
 .
-├── ReaderDownloader.js                  # 默认构建产物，可直接作为 userscript 导入
+├── XJTUPdfDownloader.js                 # 默认构建产物，可直接作为 userscript 导入
 ├── dist/
-│   └── ReaderDownloader.user.js         # 分发用 userscript 文件
+│   └── XJTUPdfDownloader.user.js        # 分发用 userscript 文件
 ├── scripts/
-│   └── build-reader-downloader.js       # 构建脚本：按文件名顺序拼接 source parts
+│   └── build-xjtu-pdf-downloader.js     # 构建脚本：按文件名顺序拼接 source parts
 ├── src/
 │   └── reader_downloader/
 │       ├── README.md                    # 分片源码说明
@@ -72,21 +72,21 @@
 在仓库根目录执行：
 
 ```bash
-node scripts/build-reader-downloader.js
+node scripts/build-xjtu-pdf-downloader.js
 ```
 
 默认会生成两个文件：
 
-- `ReaderDownloader.js`
-- `dist/ReaderDownloader.user.js`
+- `XJTUPdfDownloader.js`
+- `dist/XJTUPdfDownloader.user.js`
 
 也可以额外指定一个自定义输出路径：
 
 ```bash
-node scripts/build-reader-downloader.js ./out/ReaderDownloader.js
+node scripts/build-xjtu-pdf-downloader.js ./out/XJTUPdfDownloader.js
 ```
 
-无论是否指定自定义输出，`dist/ReaderDownloader.user.js` 都会同时刷新。
+无论是否指定自定义输出，`dist/XJTUPdfDownloader.user.js` 都会同时刷新。
 
 ## 安装与使用
 
@@ -94,8 +94,8 @@ node scripts/build-reader-downloader.js ./out/ReaderDownloader.js
 
 优先使用以下任一文件导入 Tampermonkey：
 
-- `dist/ReaderDownloader.user.js`
-- `ReaderDownloader.js`
+- `dist/XJTUPdfDownloader.user.js`
+- `XJTUPdfDownloader.js`
 
 脚本元数据当前只匹配：
 
@@ -155,7 +155,7 @@ window.__readerPagePidMap
 - 脚本通过 `GM_xmlhttpRequest(...).finalUrl` 读取最终地址并提取 `pid`
 - PDF 生成依赖 userscript 头里的 `jsPDF` CDN 引用
 
-更多平台链路和接口参数分析，见 [request-chain-and-params.md](/home/alan/workspace/libScripts/request-chain-and-params.md)。
+更多平台链路和接口参数分析，见 [request-chain-and-params.md](./request-chain-and-params.md)。
 
 ## 已知限制
 

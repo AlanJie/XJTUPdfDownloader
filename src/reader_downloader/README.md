@@ -1,4 +1,4 @@
-# ReaderDownloader Split Source
+# XJTUPdfDownloader Split Source
 
 This directory stores the maintainable source parts for the userscript.
 
@@ -20,10 +20,10 @@ This directory stores the maintainable source parts for the userscript.
 From repo root:
 
 ```bash
-node scripts/build-reader-downloader.js
+node scripts/build-xjtu-pdf-downloader.js
 ```
 
 Outputs:
 
-- `ReaderDownloader.js`
-- `dist/ReaderDownloader.user.js`
+- `XJTUPdfDownloader.js`
+- `dist/XJTUPdfDownloader.user.js`
